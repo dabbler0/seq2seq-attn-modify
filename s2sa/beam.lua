@@ -8,6 +8,7 @@ require 's2sa.scorer'
 
 path = require 'pl.path'
 stringx = require 'pl.stringx'
+json = require 'json'
 
 local sent_id = 0
 local opt = {}
@@ -22,6 +23,9 @@ cmd:option('-src_dict', 'data/demo.src.dict', [[Path to source vocabulary (*.src
 cmd:option('-targ_dict', 'data/demo.targ.dict', [[Path to target vocabulary (*.targ.dict file)]])
 cmd:option('-feature_dict_prefix', 'data/demo', [[Prefix of the path to features vocabularies (*.feature_N.dict files)]])
 cmd:option('-char_dict', 'data/demo.char.dict', [[If using chars, path to character vocabulary (*.char.dict file)]])
+
+-- projection space option
+cmd:option('-projection', '', [[file containing a basis on which to project (one line per sequence)]])
 
 -- beam search options
 cmd:option('-beam', 5, [[Beam size]])
@@ -115,7 +119,7 @@ function flat_to_rc(v, flat_index)
   return row, (flat_index - 1) % v:size(2) + 1
 end
 
-function generate_beam(model, initial, K, max_sent_l, source, source_features, gold)
+function generate_beam(model, initial, K, max_sent_l, source, source_features, gold, modifications)
   --reset decoder initial states
   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
     cutorch.setDevice(opt.gpuid)
@@ -161,8 +165,29 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
     append_table(encoder_input, rnn_state_enc)
     local out = model[1]:forward(encoder_input)
     rnn_state_enc = out
+
     context[{{},t}]:copy(out[#out])
   end
+
+  -- Context here has size 1 x source_l x rnn_size
+  if has_projection then
+    -- out[#out] here should be (batch_size = 1) x dims
+    -- multiply by the projection matrix to get the projected
+    -- encoding.
+    local tmp = context[1]:clone()
+    context[1]:mm(tmp, projection_matrix)
+  end
+
+  -- If modifications is given, then we dissect
+  -- the encoding a little bit.
+  --
+  -- Modifications will be a list of neurons to change.
+  if modifications then
+    for i = 1, #modifications do
+      context[1][modifications[i]['position']] = modifications[i]['value']
+    end
+  end
+
   rnn_state_dec = {}
   for i = 1, #init_fwd_dec do
     table.insert(rnn_state_dec, init_fwd_dec[i]:zero())
@@ -647,6 +672,19 @@ function init(arg)
   model_opt.attn = model_opt.attn or 1
   model_opt.num_source_features = model_opt.num_source_features or 0
 
+  -- If there was a given projection space onto which to
+  -- project the encodings, load them
+  if opt.projection ~= '' then
+      -- Projection matrix will be in JSON form
+      local f = io.open(opt.projection)
+      projection_matrix = json.decode(f:read())
+      f:close()
+
+      -- Turn into CudaTensor
+      projection_matrix = torch.CudaTensor(projection_matrix)
+      has_projection = true
+  end
+
   idx2word_src = idx2key(opt.src_dict)
   word2idx_src = flip_table(idx2word_src)
   idx2word_targ = idx2key(opt.targ_dict)
@@ -751,11 +789,14 @@ function init(arg)
   sent_id = 0
 end
 
-function search(line)
+function search(line, modifications)
   sent_id = sent_id + 1
+  if not modifications then
+    print(sent_id)
+  end
   local cleaned_tokens, source_features_str = extract_features(line)
   local cleaned_line = table.concat(cleaned_tokens, ' ')
-  print('SENT ' .. sent_id .. ': ' ..line)
+  -- print('SENT ' .. sent_id .. ': ' ..line)
   local source, source_str
   local source_features = features2featureidx(source_features_str, feature2idx_src, model_opt.start_symbol)
   if model_opt.use_chars_enc == 0 then
@@ -768,12 +809,12 @@ function search(line)
   end
   state = State.initial(START)
   pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam(model,
-    state, opt.beam, MAX_SENT_L, source, source_features, target)
+    state, opt.beam, MAX_SENT_L, source, source_features, target, modifications)
   pred_score_total = pred_score_total + pred_score
   pred_words_total = pred_words_total + #pred - 1
   pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
 
-  print('PRED ' .. sent_id .. ': ' .. pred_sent)
+  -- print('PRED ' .. sent_id .. ': ' .. pred_sent)
   if gold ~= nil then
     print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
     if opt.score_gold == 1 then
@@ -794,7 +835,7 @@ function search(line)
     end
   end
 
-  print('')
+  -- print('')
 
   return pred_sent, nbests
 end
